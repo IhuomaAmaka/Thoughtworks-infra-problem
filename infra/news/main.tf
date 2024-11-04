@@ -14,325 +14,92 @@ locals {
   ecr_url = data.aws_ssm_parameter.ecr.value
 }
 
-resource "aws_security_group" "ssh_access" {
-  vpc_id      = "${local.vpc_id}"
-  name        = "${var.prefix}-ssh_access"
-  description = "SSH access group"
+module "alb-quotes" {
+  source  = "../../infra-modules-alb"
 
-  ingress {
-    from_port = 22
-    to_port = 22
-    protocol = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+  name     = "${var.prefix}-alb-quotes"
+  vpc_id   = module.vpc.vpc_id
+  subnets  = module.vpc.private_subnets
+  internal = true
+
+  security_group_ingress_rules = {
+    all_http = {
+      from_port   = 80
+      to_port     = 82
+      ip_protocol = "tcp"
+      description = "HTTP web traffic"
+      cidr_ipv4   = "0.0.0.0/0"
+    }
+    all_https = {
+      from_port   = 443
+      to_port     = 445
+      ip_protocol = "tcp"
+      description = "HTTPS web traffic"
+      cidr_ipv4   = "0.0.0.0/0"
+    }
   }
 
-  tags = {
-    Name = "Allow HTTP"
-    createdBy = "infra-${var.prefix}/news"
-  }
-}
-
-resource "aws_key_pair" "ssh_key" {
-  key_name   = "${var.prefix}-news"
-  public_key = "${file("${path.module}/../id_rsa.pub")}"
-}
-
-data "aws_ami" "amazon_linux_2" {
- most_recent = true
-
- filter {
-   name   = "name"
-   values = ["amzn2-ami-hvm*"]
- }
-
- filter {
-   name = "architecture"
-   values = ["x86_64"]
- }
-
- owners = ["137112412989"] #amazon
-}
-
-### Front end
-
-resource "aws_security_group" "front_end_sg" {
-  vpc_id      = "${local.vpc_id}"
-  name        = "${var.prefix}-front_end"
-  description = "Security group for front_end"
-
-  tags = {
-    Name = "SG for front_end"
-    createdBy = "infra-${var.prefix}/news"
-  }
-}
-
-# Allow all outbound connections
-resource "aws_security_group_rule" "front_end_all_out" {
-  type        = "egress"
-  to_port           = 0
-  from_port         = 0
-  protocol          = "-1"
-  cidr_blocks = [ "0.0.0.0/0" ]
-  security_group_id = "${aws_security_group.front_end_sg.id}"
-}
-
-resource "aws_instance" "front_end" {
-  ami           = "${data.aws_ami.amazon_linux_2.id}"
-  instance_type = "${var.instance_type}"
-  key_name      = "${aws_key_pair.ssh_key.key_name}"
-  associate_public_ip_address = true
-
-  root_block_device {
-    volume_type = "gp2"
-    volume_size = 8
-    delete_on_termination = true
+  security_group_egress_rules = {
+    all = {
+      ip_protocol = "-1"
+      cidr_ipv4   = module.vpc.vpc_cidr_block
+    }
   }
 
-  iam_instance_profile = "${var.prefix}-news_host"
-
-  availability_zone = "${var.region}a"
-
-  subnet_id = local.subnet_id
-
-  vpc_security_group_ids = [
-    "${aws_security_group.front_end_sg.id}",
-    "${aws_security_group.ssh_access.id}"
-  ]
-
-  tags = {
-    Name = "${var.prefix}-front_end"
-    createdBy = "infra-${var.prefix}/news"
+  listeners = {
+    ex_http_https_redirect = {
+      port     = 80
+      protocol = "HTTP"
+      redirect = {
+        port        = "443"
+        protocol    = "HTTPS"
+        status_code = "HTTP_301"
+      }
+    }
   }
 
-  connection {
-    host = "${self.public_ip}"
-    type = "ssh"
-    user = "ec2-user"
-    private_key = "${file("${path.module}/../id_rsa")}"
-  }
-
-  provisioner "remote-exec" {
-    script = "${path.module}/provision-docker.sh"
+  target_groups = {
+    asg_target_group = {
+      name_prefix                       = "asg"
+      protocol                          = "HTTP"
+      port                              = 80
+      target_type                       = "instance"
+      health_check = {
+        enabled             = true
+        interval            = 30
+        path                = "/healthz"
+        port                = "traffic-port"
+        healthy_threshold   = 3
+        unhealthy_threshold = 3
+        timeout             = 6
+        protocol            = "HTTP"
+        matcher             = "200-399"
+      }
+    }
   }
 }
 
-# Allow public access to the front-end server
-resource "aws_security_group_rule" "front_end" {
-  type        = "ingress"
-  from_port   = 8080
-  to_port     = 8080
-  protocol    = "tcp"
-  cidr_blocks = [ "0.0.0.0/0" ]
+module "asg-quotes" {
+  source = "../../infra-modules/asg"
 
-  security_group_id = "${aws_security_group.front_end_sg.id}"
-}
-### end of front-end
+  name                  = "quotes-${var.prefix}"
+  vpc_zone_identifier   = module.vpc.private_subnets
+  target_group_arns     = [module.alb.target_groups["asg_target_group"].arn]
 
-resource "aws_security_group" "quotes_sg" {
-  vpc_id      = "${local.vpc_id}"
-  name        = "${var.prefix}-quotes_sg"
-  description = "Security group for quotes"
-
-  tags = {
-    Name = "SG for quotes"
-    createdBy = "infra-${var.prefix}/news"
-  }
+  # Launch template configuration
+  image_id              = data.aws_ami.amazon_linux.id
+  instance_type         = "t3.micro"
+  user_data             = filebase64("${path.module}/scripts/provision-quotes.sh")
+  desired_capacity      = 1
+  min_size              = 1
+  max_size              = 3
 }
 
-# Allow all outbound connections
-resource "aws_security_group_rule" "quotes_all_out" {
-  type        = "egress"
-  to_port           = 0
-  from_port         = 0
-  protocol          = "-1"
-  cidr_blocks = [ "0.0.0.0/0" ]
-  security_group_id = "${aws_security_group.quotes_sg.id}"
+output "repository_urls" {
+  description = "URLs of the created ECR repositories"
+  value       = [for repo in module.ecr : repo.repository_url]
 }
 
-resource "aws_instance" "quotes" {
-  ami           = "${data.aws_ami.amazon_linux_2.id}"
-  instance_type = "${var.instance_type}"
-  key_name      = "${aws_key_pair.ssh_key.key_name}"
-  associate_public_ip_address = true
-
-  root_block_device {
-    volume_type = "gp2"
-    volume_size = 8
-    delete_on_termination = true
-  }
-
-  iam_instance_profile = "${var.prefix}-news_host"
-
-  availability_zone = "${var.region}a"
-
-  subnet_id = local.subnet_id
-
-  vpc_security_group_ids = [
-    "${aws_security_group.quotes_sg.id}",
-    "${aws_security_group.ssh_access.id}"
-  ]
-
-  tags = {
-    Name = "${var.prefix}-quotes"
-    createdBy = "infra-${var.prefix}/news"
-  }
-
-  connection {
-    host = "${self.public_ip}"
-    type = "ssh"
-    user = "ec2-user"
-    private_key = "${file("${path.module}/../id_rsa")}"
-  }
-
-  provisioner "remote-exec" {
-    script = "${path.module}/provision-docker.sh"
-  }
-}
-
-# Allow internal access to the quotes HTTP server from front-end
-resource "aws_security_group_rule" "quotes_internal_http" {
-  type        = "ingress"
-  from_port   = 8082
-  to_port     = 8082
-  protocol    = "tcp"
-  source_security_group_id = "${aws_security_group.front_end_sg.id}"
-  security_group_id = "${aws_security_group.quotes_sg.id}"
-}
-
-resource "null_resource" "quotes_provision" {
-  connection {
-      host = "${aws_instance.quotes.public_ip}"
-      type = "ssh"
-      user = "ec2-user"
-      private_key = "${file("${path.module}/../id_rsa")}"
-  }
-  provisioner "file" {
-    source = "${path.module}/provision-quotes.sh"
-    destination = "/home/ec2-user/provision.sh"
-  }
-  provisioner "remote-exec" {
-    inline = [
-      "chmod +x /home/ec2-user/provision.sh",
-      "/home/ec2-user/provision.sh ${local.ecr_url}quotes:latest"
-    ]
-  }
-}
-
-resource "aws_security_group" "newsfeed_sg" {
-  vpc_id      = "${local.vpc_id}"
-  name        = "${var.prefix}-newsfeed_sg"
-  description = "Security group for newsfeed"
-
-  tags = {
-    Name = "SG for newsfeed"
-    createdBy = "infra-${var.prefix}/news"
-  }
-}
-
-# Allow all outbound connections
-resource "aws_security_group_rule" "newsfeed_all_out" {
-  type        = "egress"
-  to_port           = 0
-  from_port         = 0
-  protocol          = "-1"
-  cidr_blocks = [ "0.0.0.0/0" ]
-  security_group_id = "${aws_security_group.newsfeed_sg.id}"
-}
-
-resource "aws_instance" "newsfeed" {
-  ami           = "${data.aws_ami.amazon_linux_2.id}"
-  instance_type = "${var.instance_type}"
-  key_name      = "${aws_key_pair.ssh_key.key_name}"
-  associate_public_ip_address = true
-
-  root_block_device {
-    volume_type = "gp2"
-    volume_size = 8
-    delete_on_termination = true
-  }
-
-  iam_instance_profile = "${var.prefix}-news_host"
-
-  availability_zone = "${var.region}a"
-
-  subnet_id = local.subnet_id
-
-  vpc_security_group_ids = [
-    "${aws_security_group.newsfeed_sg.id}",
-    "${aws_security_group.ssh_access.id}"
-  ]
-
-  tags = {
-    Name = "${var.prefix}-newsfeed"
-    createdBy = "infra-${var.prefix}/news"
-  }
-
-  connection {
-    host = "${self.public_ip}"
-    type = "ssh"
-    user = "ec2-user"
-    private_key = "${file("${path.module}/../id_rsa")}"
-  }
-
-  provisioner "remote-exec" {
-    script = "${path.module}/provision-docker.sh"
-  }
-}
-
-# Allow internal access to the newsfeed HTTP server from front-end
-resource "aws_security_group_rule" "newsfeed_internal_http" {
-  type        = "ingress"
-  from_port   = 8081
-  to_port     = 8081
-  protocol    = "tcp"
-  source_security_group_id = "${aws_security_group.front_end_sg.id}"
-  security_group_id = "${aws_security_group.newsfeed_sg.id}"
-}
-
-resource "null_resource" "newsfeed_provision" {
-  connection {
-      host = "${aws_instance.newsfeed.public_ip}"
-      type = "ssh"
-      user = "ec2-user"
-      private_key = "${file("${path.module}/../id_rsa")}"
-  }
-  provisioner "file" {
-    source = "${path.module}/provision-newsfeed.sh"
-    destination = "/home/ec2-user/provision.sh"
-  }
-  provisioner "remote-exec" {
-    inline = [
-      "chmod +x /home/ec2-user/provision.sh",
-      "/home/ec2-user/provision.sh ${local.ecr_url}newsfeed:latest"
-    ]
-  }
-}
-
-resource "null_resource" "front_end_provision" {
-  connection {
-      host = "${aws_instance.front_end.public_ip}"
-      type = "ssh"
-      user = "ec2-user"
-      private_key = "${file("${path.module}/../id_rsa")}"
-  }
-  provisioner "file" {
-    source = "${path.module}/provision-front_end.sh"
-    destination = "/home/ec2-user/provision.sh"
-  }
-  provisioner "remote-exec" {
-    inline = [
-      "chmod +x /home/ec2-user/provision.sh",
-<<EOF
-      /home/ec2-user/provision.sh \
-      --region ${var.region} \
-      --docker-image ${local.ecr_url}front_end:latest \
-      --quote-service-url http://${aws_instance.quotes.private_ip}:8082 \
-      --newsfeed-service-url http://${aws_instance.newsfeed.private_ip}:8081 \
-      --static-url http://${aws_s3_bucket.news.website_endpoint}
-EOF
-    ]
-  }
-}
 
 output "frontend_url" {
   value = "http://${aws_instance.front_end.public_ip}:8080"

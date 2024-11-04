@@ -38,6 +38,34 @@ resource "aws_s3_bucket_acl" "terraform_infra" {
   acl    = "private"
 }
 
+module "terraform-infra" {
+  source = "../../infra-modules/s3"
+
+  bucket        = "terraform-infra-${var.prefix}"
+  force_destroy = true
+  versioning {
+    enabled = true
+  }
+
+  # To cleanup old states eventually
+  lifecycle_rule {
+    enabled = true
+
+    noncurrent_version_expiration {
+      days = 90
+    }
+  }
+  tags = {
+     Name = "Bucket for terraform states of ${var.prefix}"
+     createdBy = "infra/backend-support"
+     #more tags
+  }
+  control_object_ownership = true
+  object_ownership         = "BucketOwnerPreferred"
+
+  acl = "private" # "acl" conflicts with "grant" and "owner"
+}
+
 resource "aws_dynamodb_table" "dynamodb-table" {
   name           = "${var.prefix}-terraform-locks"
   # up to 25 per account is free
